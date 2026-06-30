@@ -89,6 +89,21 @@ Splats store **view-dependent color** (spherical harmonics) with the capture lig
 
 **Honest framing:** original lighting is baked in, so this is an *approximate, artistic* relight, not physical delighting. That's fine — a draggable sun reshaping a scanned object is the wow factor. Full PBR decomposition is a stretch goal (§5).
 
+### 3a. Research grounding — what we take from which paper (verified 2026-06)
+
+Our pipeline is the **forward, artistic** half of relightable Gaussian splatting. The core trick is lifted faithfully from a real paper; the shading half is deliberately the simplified, non-physical version. Map:
+
+| Our step (§3) | Grounded in | What we TAKE | What we LEAVE (and why) |
+|---|---|---|---|
+| 1. Normal = shortest covariance axis | **GaussianShader** (CVPR 2024) | The exact heuristic: flattened Gaussians converge to surface-aligned discs, so the shortest ellipsoid axis ≈ surface normal. | Their *learned normal residual* and joint optimization — we use the raw axis. |
+| 2. Normal sign disambiguation | **GaussianShader** names the inward/outward ambiguity | The framing of the problem. | Their two-residual learned fix; we just flip toward the camera / enforce neighbor consistency. |
+| 3. SH DC term as albedo | our simplification (common proxy) | DC coeff as a rough base color. | True albedo recovery (needs inverse rendering). |
+| 4. Lambert + Blinn-Phong + ambient | classic real-time graphics, **not** splat research | A cheap, tweakable, intuitive shading model. | Physically-based BRDFs (Cook-Torrance/Disney) that the relighting papers optimize. |
+
+**Cleaner-normals escape hatch:** if raw shortest-axis normals are too noisy (the §5 risk), **2D Gaussian Splatting** (SIGGRAPH 2024) is the principled fix — it flattens Gaussians to oriented discs so the normal is *exact*, not estimated.
+
+**The rigorous version we're approximating** (for the writeup / stretch goal): **Relightable 3D Gaussians** (ECCV 2024) augments each Gaussian with normal + BRDF + incident light, decomposes them via physically-based *differentiable* rendering, and ray-traces visibility for real shadows. **GS-IR** and **RTR-GS** are in the same inverse-rendering family. We do **none** of that decomposition — that's the honest gap, and the right thing to state plainly in the portfolio: *"forward shading approximation, same shortest-axis normal as GaussianShader, without the inverse-rendering optimization."*
+
 ---
 
 ## 4. Phased build plan (each phase = build tasks + a learning checkpoint)
@@ -170,8 +185,14 @@ Don't advance until the previous **learning checkpoint** passes — not just the
 - `antimatter15/splat` — minimal WebGL, no deps, CPU sort in a worker.
 - `Scthe/gaussian-splatting-webgpu` — WebGPU + compute sort, with a companion math blog post.
 
-**Papers**
+**Papers — foundation**
 - Kerbl et al. 2023 — *3D Gaussian Splatting for Real-Time Radiance Field Rendering* (the foundation).
+
+**Papers — relighting (what Phase 2 draws on; see §3a for the take/leave map)**
+- **GaussianShader** (CVPR 2024) — `arXiv:2311.17977`. *Source of our normal = shortest-covariance-axis approach + the sign-ambiguity framing.* The one to read before Phase 2.
+- **2D Gaussian Splatting** (SIGGRAPH 2024) — `arXiv:2403.17888`. Disc primitives with *exact* normals — our escape hatch if shortest-axis normals are too noisy.
+- **Relightable 3D Gaussians** (ECCV 2024) — `arXiv:2311.16043`. The full physically-based version we're approximating: normal + BRDF + incident light + ray-traced shadows.
+- **GS-IR**, **RTR-GS** (`arXiv:2507.07733`), **Normal-GS** (`arXiv:2410.20593`) — the broader Gaussian inverse-rendering family.
 - *GaSLight* (ICCV 2025), *GBake* (SIGGRAPH 2025) — splats + lighting / probe baking.
 - *ROGR: Relightable 3D Objects using Generative Relighting* (2025) — for the stretch PBR direction.
 
