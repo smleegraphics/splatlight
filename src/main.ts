@@ -6,7 +6,18 @@ import { initWebGPU } from './gpu/context';
 import { createBufferWithData, writeBuffer } from './gpu/buffers';
 import { OrbitCamera } from './camera/orbit-camera';
 import { makeReferenceGrid } from './scene/reference-grid';
+import { makeSyntheticCloud, cloudToPointVertices } from './scene/splat-data';
 import lineShaderSrc from './shaders/line.wgsl?raw';
+import pointsShaderSrc from './shaders/points.wgsl?raw';
+
+// pos(3) + color(3) interleaved, all f32 — shared by the grid and point pipelines.
+const POS_COLOR_LAYOUT: GPUVertexBufferLayout = {
+  arrayStride: 6 * 4,
+  attributes: [
+    { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
+    { shaderLocation: 1, offset: 12, format: 'float32x3' }, // color
+  ],
+};
 
 const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
 
@@ -35,19 +46,7 @@ async function main(): Promise<void> {
   const shaderModule = device.createShaderModule({ code: lineShaderSrc });
   const pipeline = device.createRenderPipeline({
     layout: 'auto',
-    vertex: {
-      module: shaderModule,
-      entryPoint: 'vs',
-      buffers: [
-        {
-          arrayStride: 6 * 4, // pos(3) + color(3), all f32
-          attributes: [
-            { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
-            { shaderLocation: 1, offset: 12, format: 'float32x3' }, // color
-          ],
-        },
-      ],
-    },
+    vertex: { module: shaderModule, entryPoint: 'vs', buffers: [POS_COLOR_LAYOUT] },
     fragment: { module: shaderModule, entryPoint: 'fs', targets: [{ format }] },
     primitive: { topology: 'line-list' },
     depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
@@ -55,6 +54,28 @@ async function main(): Promise<void> {
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
+  });
+
+  // Splat cloud → one flat-colored point per Gaussian. Synthetic for now; swap in
+  // parseSplat(fileBuffer) here to load a real .splat. Same camera, point topology.
+  const cloud = makeSyntheticCloud();
+  const pointBuffer = createBufferWithData(
+    device,
+    cloudToPointVertices(cloud),
+    GPUBufferUsage.VERTEX,
+    'splat-points',
+  );
+  const pointsModule = device.createShaderModule({ code: pointsShaderSrc });
+  const pointsPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: pointsModule, entryPoint: 'vs', buffers: [POS_COLOR_LAYOUT] },
+    fragment: { module: pointsModule, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'point-list' },
+    depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
+  });
+  const pointsBindGroup = device.createBindGroup({
+    layout: pointsPipeline.getBindGroupLayout(0),
     entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
   });
 
@@ -102,6 +123,11 @@ async function main(): Promise<void> {
     pass.setBindGroup(0, bindGroup);
     pass.setVertexBuffer(0, vertexBuffer);
     pass.draw(grid.vertexCount);
+
+    pass.setPipeline(pointsPipeline);
+    pass.setBindGroup(0, pointsBindGroup);
+    pass.setVertexBuffer(0, pointBuffer);
+    pass.draw(cloud.count);
     pass.end();
 
     device.queue.submit([encoder.finish()]);
