@@ -1,0 +1,21 @@
+{
+  "name": "splatlight",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A from-scratch WebGPU 3D Gaussian splat renderer with dynamic lighting (learning project).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.52",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  },
+  "dependencies": {
+    "wgpu-matrix": "^3.4.0"
+  }
+}
