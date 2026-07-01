@@ -56,5 +56,7 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 
 **Also learned:** EWA = **Elliptical Weighted Average** (Heckbert 1989 texture filtering → Zwicker et al. surface splatting → 3DGS); the "elliptical" is the screen-space `Σ'` footprint, the "weighted average" is the Gaussian falloff.
 
+**Real data (`.ply` loading):** Wrote a binary `.ply` parser. Unlike `.splat`, a 3DGS `.ply` stores the RAW trainable values, so the parser applies the activations on the way in: **scale→exp, opacity→sigmoid, rotation→normalize**, and **f_dc → 0.5 + C0·f_dc** for base color (`C0` = degree-0 SH basis constant). Loaded `luigi.ply` (14,526 splats, object-centric) — a real capture through the whole pipeline. This file is **DC-only** (no `f_rest`), so it shows base color but no view-dependent SH.
+
 **Open questions to revisit:**
-- How is view-dependent color (spherical harmonics) evaluated per frame, and how do we get real SH data (a `.ply`) into the renderer? (Phase 1 — last concept)
+- How is higher-order SH evaluated per view direction to make color view-dependent, and what full-SH scene do we test it on? (Phase 1 — last concept; luigi is DC-only, so we need a fabricated or full-SH example to *see* it.)

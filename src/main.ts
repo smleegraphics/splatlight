@@ -13,6 +13,8 @@ import {
   cloudToSplatInstances,
 } from './scene/splat-data';
 import { makeUnitSphere } from './scene/unit-sphere';
+import { parsePly } from './scene/ply-parser';
+import type { SplatCloud } from './scene/splat-data';
 import lineShaderSrc from './shaders/line.wgsl?raw';
 import pointsShaderSrc from './shaders/points.wgsl?raw';
 import ellipsoidShaderSrc from './shaders/ellipsoid.wgsl?raw';
@@ -62,6 +64,52 @@ const SPLAT_INSTANCE_LAYOUT: GPUVertexBufferLayout = {
 
 const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
 
+/** Fetch + parse the default .ply scene; fall back to the synthetic sphere. */
+async function loadCloud(): Promise<SplatCloud> {
+  try {
+    const res = await fetch(`${import.meta.env.BASE_URL}luigi.ply`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const cloud = parsePly(await res.arrayBuffer());
+    console.log(`Loaded luigi.ply: ${cloud.count} splats`);
+    return cloud;
+  } catch (err) {
+    console.warn('Could not load luigi.ply — falling back to synthetic cloud.', err);
+    return makeSyntheticCloud();
+  }
+}
+
+/** Point the camera at the cloud's centroid and back off to frame its extent. */
+function fitCameraToCloud(camera: OrbitCamera, cloud: SplatCloud): void {
+  const n = cloud.count;
+  if (n === 0) return;
+  let cx = 0;
+  let cy = 0;
+  let cz = 0;
+  for (let i = 0; i < n; i++) {
+    cx += cloud.positions[i * 3];
+    cy += cloud.positions[i * 3 + 1];
+    cz += cloud.positions[i * 3 + 2];
+  }
+  cx /= n;
+  cy /= n;
+  cz /= n;
+  let r = 0;
+  for (let i = 0; i < n; i++) {
+    const d = Math.hypot(
+      cloud.positions[i * 3] - cx,
+      cloud.positions[i * 3 + 1] - cy,
+      cloud.positions[i * 3 + 2] - cz,
+    );
+    if (d > r) r = d;
+  }
+  camera.target[0] = cx;
+  camera.target[1] = cy;
+  camera.target[2] = cz;
+  camera.distance = r * 2.2;
+  camera.near = Math.max(0.001, r * 0.002);
+  camera.far = Math.max(camera.far, r * 20);
+}
+
 async function main(): Promise<void> {
   const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
   const { device, context, format } = await initWebGPU(canvas);
@@ -99,9 +147,10 @@ async function main(): Promise<void> {
     entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
   });
 
-  // Splat cloud → one flat-colored point per Gaussian. Synthetic for now; swap in
-  // parseSplat(fileBuffer) here to load a real .splat. Same camera, point topology.
-  const cloud = makeSyntheticCloud();
+  // Load a real captured scene (falls back to the synthetic sphere on failure),
+  // then frame the camera to it.
+  const cloud = await loadCloud();
+  fitCameraToCloud(camera, cloud);
   const pointBuffer = createBufferWithData(
     device,
     cloudToPointVertices(cloud),
