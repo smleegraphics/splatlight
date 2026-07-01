@@ -3,3 +3,7 @@ dist
 .DS_Store
 *.log
 .vite
+
+# Splat test assets — not committed (see public/README.md to fetch)
+public/*.ply
+public/*.splat

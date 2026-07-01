@@ -85,6 +85,11 @@ export class OrbitCamera {
     vec3.addScaled(this.target, up, dy * k, this.target);
   }
 
+  /** The world→camera matrix from the last update() (needed for EWA projection). */
+  get viewMatrix(): Mat4 {
+    return this.view;
+  }
+
   /** Recompute and return the view-projection matrix for the given aspect ratio. */
   update(aspect: number): Mat4 {
     const ce = Math.cos(this.elevation);
