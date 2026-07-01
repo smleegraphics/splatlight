@@ -21,5 +21,25 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 **Plumbing built:** Vite + TS + WebGPU scaffold — device/canvas init, orbit camera, render loop, reference grid + XYZ axes so the camera is visibly working.
 
 **Open questions to revisit:**
-- How exactly does `Σ = R S Sᵀ Rᵀ` make an ellipsoid? (Phase 1, [concept])
+- How exactly does `Σ = R S Sᵀ Rᵀ` make an ellipsoid? (Phase 1, [concept]) — **answered in Session 2**
 - How do we get a usable surface normal out of a blob that's only described by a covariance? (Phase 2)
+
+---
+
+## Session 2 — Phase 1 start: the 3D covariance
+
+**Concept covered:** 3D covariance from scale + rotation (syllabus #2), plus refreshers on eigenvectors/eigenvalues, spherical harmonics, and `.ply` vs `.splat`.
+
+**Key insight (plain language):** A splat's shape is one 3×3 matrix, `Σ = R S² Rᵀ`.
+- Build it as a transform `M = R·S` that maps a unit sphere → the ellipsoid: `S = diag(sx,sy,sz)` scales it (the axis radii), `R` (from the quaternion) rotates it. The covariance is `Σ = M Mᵀ = R S² Rᵀ`.
+- **Eigenvectors of `Σ`** = the ellipsoid's axis directions (columns of `R`); **eigenvalues** = `sx², sy², sz²`, so axis radius = √eigenvalue = the scale. (An eigenvector is a direction a matrix only scales, not rotates; the eigenvalue is the scale factor.)
+- **Order matters:** scale in the *local* frame first, then rotate (`R` on the outside). Rotate-first would flatten every splat along fixed *world* axes and discard its orientation — and rotating a sphere does nothing, so the rotation would be wasted.
+- **Shape from scales:** two big + one tiny = flat disk; one big + two tiny = rod; all equal = sphere.
+- **Phase 2 preview:** the shortest axis (smallest eigenvalue) of a flattened, surface-aligned splat is the surface **normal**.
+
+**Also clarified:** SH stores view-dependent *color* (bands = angular detail, DC = base color), and it's the *baked appearance* that makes relighting hard — not a lighting helper. `.ply` keeps the higher SH coeffs (view-dependent highlight); `.splat` drops them (flat color). Neither format carries a usable normal (3DGS writes zeros), which is why Phase 2 computes them from `Σ`.
+
+**Debug viz built:** each splat drawn as its real 3D ellipsoid (vertex shader does `world = R * (spherePos * scale) + center`), synthetic cloud reshaped into surface-tangent flattened disks, `v` toggles ellipsoids vs. flat points.
+
+**Open questions to revisit:**
+- How does the 3D covariance get projected to a 2D screen-space ellipse, and why is a Jacobian involved? (Phase 1, EWA — next)

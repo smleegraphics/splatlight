@@ -6,9 +6,11 @@ import { initWebGPU } from './gpu/context';
 import { createBufferWithData, writeBuffer } from './gpu/buffers';
 import { OrbitCamera } from './camera/orbit-camera';
 import { makeReferenceGrid } from './scene/reference-grid';
-import { makeSyntheticCloud, cloudToPointVertices } from './scene/splat-data';
+import { makeSyntheticCloud, cloudToPointVertices, cloudToInstanceData } from './scene/splat-data';
+import { makeUnitSphere } from './scene/unit-sphere';
 import lineShaderSrc from './shaders/line.wgsl?raw';
 import pointsShaderSrc from './shaders/points.wgsl?raw';
+import ellipsoidShaderSrc from './shaders/ellipsoid.wgsl?raw';
 
 // pos(3) + color(3) interleaved, all f32 — shared by the grid and point pipelines.
 const POS_COLOR_LAYOUT: GPUVertexBufferLayout = {
@@ -16,6 +18,22 @@ const POS_COLOR_LAYOUT: GPUVertexBufferLayout = {
   attributes: [
     { shaderLocation: 0, offset: 0, format: 'float32x3' }, // position
     { shaderLocation: 1, offset: 12, format: 'float32x3' }, // color
+  ],
+};
+
+// Ellipsoid debug view: unit-sphere mesh (per vertex) + splat data (per instance).
+const SPHERE_LAYOUT: GPUVertexBufferLayout = {
+  arrayStride: 3 * 4,
+  attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }], // sphere pos
+};
+const INSTANCE_LAYOUT: GPUVertexBufferLayout = {
+  arrayStride: 13 * 4,
+  stepMode: 'instance',
+  attributes: [
+    { shaderLocation: 1, offset: 0, format: 'float32x3' }, // center
+    { shaderLocation: 2, offset: 12, format: 'float32x3' }, // scale
+    { shaderLocation: 3, offset: 24, format: 'float32x4' }, // quaternion (x,y,z,w)
+    { shaderLocation: 4, offset: 40, format: 'float32x3' }, // color
   ],
 };
 
@@ -79,6 +97,50 @@ async function main(): Promise<void> {
     entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
   });
 
+  // Ellipsoid debug view: draw each splat as its 3D covariance shape (M = R*S on a
+  // unit sphere), instanced. Toggle against the flat points with 'v'.
+  const sphere = makeUnitSphere();
+  const sphereVertexBuffer = createBufferWithData(
+    device,
+    sphere.positions,
+    GPUBufferUsage.VERTEX,
+    'unit-sphere-verts',
+  );
+  const sphereIndexBuffer = createBufferWithData(
+    device,
+    sphere.indices,
+    GPUBufferUsage.INDEX,
+    'unit-sphere-indices',
+  );
+  const instanceBuffer = createBufferWithData(
+    device,
+    cloudToInstanceData(cloud),
+    GPUBufferUsage.VERTEX,
+    'splat-instances',
+  );
+  const ellipsoidModule = device.createShaderModule({ code: ellipsoidShaderSrc });
+  const ellipsoidPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: ellipsoidModule,
+      entryPoint: 'vs',
+      buffers: [SPHERE_LAYOUT, INSTANCE_LAYOUT],
+    },
+    fragment: { module: ellipsoidModule, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
+  });
+  const ellipsoidBindGroup = device.createBindGroup({
+    layout: ellipsoidPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
+  });
+
+  // View toggle: 'v' switches between the ellipsoid debug view and flat points.
+  let showEllipsoids = true;
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'v' || e.key === 'V') showEllipsoids = !showEllipsoids;
+  });
+
   // Depth texture is recreated whenever the canvas backing size changes.
   let depthTexture: GPUTexture | null = null;
   const ensureSize = (): void => {
@@ -124,10 +186,19 @@ async function main(): Promise<void> {
     pass.setVertexBuffer(0, vertexBuffer);
     pass.draw(grid.vertexCount);
 
-    pass.setPipeline(pointsPipeline);
-    pass.setBindGroup(0, pointsBindGroup);
-    pass.setVertexBuffer(0, pointBuffer);
-    pass.draw(cloud.count);
+    if (showEllipsoids) {
+      pass.setPipeline(ellipsoidPipeline);
+      pass.setBindGroup(0, ellipsoidBindGroup);
+      pass.setVertexBuffer(0, sphereVertexBuffer);
+      pass.setVertexBuffer(1, instanceBuffer);
+      pass.setIndexBuffer(sphereIndexBuffer, 'uint16');
+      pass.drawIndexed(sphere.indexCount, cloud.count);
+    } else {
+      pass.setPipeline(pointsPipeline);
+      pass.setBindGroup(0, pointsBindGroup);
+      pass.setVertexBuffer(0, pointBuffer);
+      pass.draw(cloud.count);
+    }
     pass.end();
 
     device.queue.submit([encoder.finish()]);
