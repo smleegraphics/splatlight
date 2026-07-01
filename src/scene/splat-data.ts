@@ -133,3 +133,31 @@ export function cloudToInstanceData(cloud: SplatCloud): Float32Array {
   }
   return out;
 }
+
+/**
+ * Per-instance data for the 2D splat (billboard) pipeline: 14 floats per splat =
+ * center(3) + scale(3) + quaternion as (x,y,z,w) (4) + color(3) + opacity(1).
+ * Opacity is needed here because the fragment falloff multiplies by it.
+ */
+export function cloudToSplatInstances(cloud: SplatCloud): Float32Array {
+  const FLOATS = 14;
+  const out = new Float32Array(cloud.count * FLOATS);
+  for (let i = 0; i < cloud.count; i++) {
+    const o = i * FLOATS;
+    out[o + 0] = cloud.positions[i * 3 + 0];
+    out[o + 1] = cloud.positions[i * 3 + 1];
+    out[o + 2] = cloud.positions[i * 3 + 2];
+    out[o + 3] = cloud.scales[i * 3 + 0];
+    out[o + 4] = cloud.scales[i * 3 + 1];
+    out[o + 5] = cloud.scales[i * 3 + 2];
+    out[o + 6] = cloud.rotations[i * 4 + 1]; // x
+    out[o + 7] = cloud.rotations[i * 4 + 2]; // y
+    out[o + 8] = cloud.rotations[i * 4 + 3]; // z
+    out[o + 9] = cloud.rotations[i * 4 + 0]; // w
+    out[o + 10] = cloud.colors[i * 3 + 0];
+    out[o + 11] = cloud.colors[i * 3 + 1];
+    out[o + 12] = cloud.colors[i * 3 + 2];
+    out[o + 13] = cloud.opacities[i];
+  }
+  return out;
+}

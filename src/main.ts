@@ -6,11 +6,17 @@ import { initWebGPU } from './gpu/context';
 import { createBufferWithData, writeBuffer } from './gpu/buffers';
 import { OrbitCamera } from './camera/orbit-camera';
 import { makeReferenceGrid } from './scene/reference-grid';
-import { makeSyntheticCloud, cloudToPointVertices, cloudToInstanceData } from './scene/splat-data';
+import {
+  makeSyntheticCloud,
+  cloudToPointVertices,
+  cloudToInstanceData,
+  cloudToSplatInstances,
+} from './scene/splat-data';
 import { makeUnitSphere } from './scene/unit-sphere';
 import lineShaderSrc from './shaders/line.wgsl?raw';
 import pointsShaderSrc from './shaders/points.wgsl?raw';
 import ellipsoidShaderSrc from './shaders/ellipsoid.wgsl?raw';
+import splatShaderSrc from './shaders/splat.wgsl?raw';
 
 // pos(3) + color(3) interleaved, all f32 — shared by the grid and point pipelines.
 const POS_COLOR_LAYOUT: GPUVertexBufferLayout = {
@@ -37,6 +43,23 @@ const INSTANCE_LAYOUT: GPUVertexBufferLayout = {
   ],
 };
 
+// 2D splat billboard: a static quad (per vertex) + splat data incl. opacity (per instance).
+const QUAD_LAYOUT: GPUVertexBufferLayout = {
+  arrayStride: 2 * 4,
+  attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }], // corner in [-1,1]
+};
+const SPLAT_INSTANCE_LAYOUT: GPUVertexBufferLayout = {
+  arrayStride: 14 * 4,
+  stepMode: 'instance',
+  attributes: [
+    { shaderLocation: 1, offset: 0, format: 'float32x3' }, // center
+    { shaderLocation: 2, offset: 12, format: 'float32x3' }, // scale
+    { shaderLocation: 3, offset: 24, format: 'float32x4' }, // quaternion (x,y,z,w)
+    { shaderLocation: 4, offset: 40, format: 'float32x3' }, // color
+    { shaderLocation: 5, offset: 52, format: 'float32' }, // opacity
+  ],
+};
+
 const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
 
 async function main(): Promise<void> {
@@ -55,9 +78,10 @@ async function main(): Promise<void> {
     'grid-vertices',
   );
 
-  // Camera uniform: a single mat4x4f = 16 floats = 64 bytes.
+  // Camera uniform: viewProj(16) + view(16) + focal(2) + viewport(2) = 36 floats.
+  const cameraData = new Float32Array(36);
   const cameraBuffer = device.createBuffer({
-    size: 64,
+    size: cameraData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
@@ -135,10 +159,56 @@ async function main(): Promise<void> {
     entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
   });
 
-  // View toggle: 'v' switches between the ellipsoid debug view and flat points.
-  let showEllipsoids = true;
+  // 2D splat billboards: project each Gaussian to a screen ellipse (EWA) and
+  // alpha-blend it. A static quad (per vertex) + splat instance data.
+  const quadBuffer = createBufferWithData(
+    device,
+    new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]),
+    GPUBufferUsage.VERTEX,
+    'splat-quad',
+  );
+  const splatInstanceBuffer = createBufferWithData(
+    device,
+    cloudToSplatInstances(cloud),
+    GPUBufferUsage.VERTEX,
+    'splat-instances-2d',
+  );
+  const splatModule = device.createShaderModule({ code: splatShaderSrc });
+  const splatPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module: splatModule,
+      entryPoint: 'vs',
+      buffers: [QUAD_LAYOUT, SPLAT_INSTANCE_LAYOUT],
+    },
+    fragment: {
+      module: splatModule,
+      entryPoint: 'fs',
+      targets: [
+        {
+          format,
+          // Premultiplied-alpha "over" compositing.
+          blend: {
+            color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        },
+      ],
+    },
+    primitive: { topology: 'triangle-list' },
+    // Transparent: test against the grid, but don't write depth (so splats blend).
+    depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: false, depthCompare: 'less' },
+  });
+  const splatBindGroup = device.createBindGroup({
+    layout: splatPipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
+  });
+
+  // View cycle: 'v' rotates through the 2D splats, the 3D ellipsoids, and points.
+  const VIEWS = ['splats', 'ellipsoids', 'points'] as const;
+  let viewIndex = 0;
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'v' || e.key === 'V') showEllipsoids = !showEllipsoids;
+    if (e.key === 'v' || e.key === 'V') viewIndex = (viewIndex + 1) % VIEWS.length;
   });
 
   // Depth texture is recreated whenever the canvas backing size changes.
@@ -161,7 +231,14 @@ async function main(): Promise<void> {
   const frame = (): void => {
     ensureSize();
     const viewProj = camera.update(canvas.width / canvas.height);
-    writeBuffer(device, cameraBuffer, viewProj);
+    const focal = (0.5 * canvas.height) / Math.tan(0.5 * camera.fovY);
+    cameraData.set(viewProj, 0);
+    cameraData.set(camera.viewMatrix, 16);
+    cameraData[32] = focal;
+    cameraData[33] = focal;
+    cameraData[34] = canvas.width;
+    cameraData[35] = canvas.height;
+    writeBuffer(device, cameraBuffer, cameraData);
 
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
@@ -186,7 +263,14 @@ async function main(): Promise<void> {
     pass.setVertexBuffer(0, vertexBuffer);
     pass.draw(grid.vertexCount);
 
-    if (showEllipsoids) {
+    const view = VIEWS[viewIndex];
+    if (view === 'splats') {
+      pass.setPipeline(splatPipeline);
+      pass.setBindGroup(0, splatBindGroup);
+      pass.setVertexBuffer(0, quadBuffer);
+      pass.setVertexBuffer(1, splatInstanceBuffer);
+      pass.draw(6, cloud.count);
+    } else if (view === 'ellipsoids') {
       pass.setPipeline(ellipsoidPipeline);
       pass.setBindGroup(0, ellipsoidBindGroup);
       pass.setVertexBuffer(0, sphereVertexBuffer);

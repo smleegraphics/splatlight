@@ -41,5 +41,14 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 
 **Debug viz built:** each splat drawn as its real 3D ellipsoid (vertex shader does `world = R * (spherePos * scale) + center`), synthetic cloud reshaped into surface-tangent flattened disks, `v` toggles ellipsoids vs. flat points.
 
+**EWA projection (same session):** The 2D screen covariance is `Σ' = J W Σ Wᵀ Jᵀ`.
+- `W` (world→camera) is linear, but the perspective divide (`x/z`, `y/z`) is **nonlinear**, so a Gaussian pushed through it isn't exactly a Gaussian.
+- Fix: replace the divide with its **local linear approximation** — the **Jacobian `J`** (matrix of partial derivatives) evaluated at the splat center. The Gaussian is concentrated there, so a linear approx over that small region is good. That makes the whole path linear, and covariance rides through any linear map `A` as `A Σ Aᵀ`.
+- Eigen-decompose the 2×2 `Σ'` → ellipse axes; size a billboard to ±3σ; fragment falloff = `exp(-½·dist²) · opacity`.
+
+**Covariance itself:** how a cloud of points spreads — diagonal = per-axis variance, off-diagonal = tilt/correlation; an ellipsoid axis radius = √(eigenvalue) = √variance = the standard deviation (= the stored scale).
+
+**Built:** the real 2D splat pipeline (`splat.wgsl`) with EWA projection + Gaussian falloff + alpha blending, rendered **unsorted** on purpose so the blending artifacts motivate sorting. `v` now cycles splats / ellipsoids / points.
+
 **Open questions to revisit:**
-- How does the 3D covariance get projected to a 2D screen-space ellipse, and why is a Jacobian involved? (Phase 1, EWA — next)
+- Why does transparent blending require back-to-front depth sorting, and why is the sort the performance bottleneck? (Phase 1 — next)
