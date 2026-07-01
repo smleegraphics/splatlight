@@ -75,6 +75,12 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 
 **Honest framing:** the eventual relight is approximate because the SH/DC color already has the capture lighting baked in.
 
+**Sign disambiguation (same session):** the shortest axis is a line, not an arrow. We flip each normal to point **away from the object centroid** — view-independent and right for an object-centric capture. (Camera-facing is simplest but makes lighting *swim* with the camera; neighbor-consistency is robust but complex.) This fixes the coarse in/out flips (torso now one color) but leaves residual noise: covariance normals are genuinely noisy on rounder splats, and the centroid trick is wrong in concave regions.
+
+**Shading (same session):** Lambert `max(dot(N,L),0)` + Blinn-Phong `pow(max(dot(N,H),0), shininess)` + ambient, driven by a Tweakpane point light (position/color/intensity/ambient/shininess/specular). The honest **baked↔relit** blend is `mix(bakedColor, lit, relight)` — we can't remove the SH-baked lighting, so relight is an artistic dial, not physical delighting. Shading is per-splat (flat), computed in the vertex shader.
+
+**Gotcha logged:** WGSL has no scalar→vector broadcast for `+`/`-` (only `*`/`/`), and no unary minus on matrices — both blanked the whole render pass (grid included) until fixed.
+
 **Open questions to revisit:**
-- How do we disambiguate the normal sign (flip to face the camera? enforce neighbor consistency?) — next.
-- The Blinn-Phong shading math and blending relit vs. baked color.
+- If the relit result is too grainy, add neighbor-based **normal smoothing** (needs a spatial grid).
+- Directional "sun" light, lighting presets, tone mapping, and optional HDRI IBL (Phase 2/3 polish).

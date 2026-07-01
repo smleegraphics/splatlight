@@ -1,22 +1,32 @@
-// [concept] The real splat: project each 3D Gaussian to a 2D screen ellipse (EWA)
-// and draw it as a soft, alpha-blended billboard.
+// [concept] The real splat: project each 3D Gaussian to a 2D screen ellipse (EWA),
+// shade it, and draw it as a soft, alpha-blended billboard.
 //
-// Vertex stage builds Σ' = J W Σ Wᵀ Jᵀ:
-//   Σ = R S² Rᵀ   the 3D covariance (world space)
-//   W             world→camera rotation (from the view matrix)
-//   J             Jacobian of the perspective divide at the splat center
-//                 (the local linear approximation of the nonlinear projection)
-// then sizes + orients a quad to the resulting 2×2 ellipse. Fragment stage
-// evaluates the 2D Gaussian falloff × opacity → alpha.
+// Vertex stage:
+//   • Σ' = J W Σ Wᵀ Jᵀ  — 3D covariance → 2D screen ellipse (EWA projection).
+//   • normal = shortest covariance axis, oriented outward (sign disambiguation).
+//   • shade with Lambert + Blinn-Phong + ambient, blended baked↔relit.
+// Fragment stage: 2D Gaussian falloff × opacity → alpha.
 
 struct Camera {
-  viewProj   : mat4x4f,
-  view       : mat4x4f,
-  focal      : vec2f, // pixels
-  viewport   : vec2f, // pixels (width, height)
-  renderMode : f32,   // 0 = SH color, 1 = normals-as-RGB debug
+  viewProj     : mat4x4f,
+  view         : mat4x4f,
+  objectCenter : vec3f, // scene centroid — used to orient normals outward
+  renderMode   : f32,   // 0 = shaded/baked color, 1 = normals-as-RGB debug
+  focal        : vec2f, // pixels
+  viewport     : vec2f, // pixels (width, height)
 };
 @group(0) @binding(0) var<uniform> camera : Camera;
+
+struct Lighting {
+  lightPos   : vec3f,
+  intensity  : f32,
+  lightColor : vec3f,
+  ambient    : f32,
+  specColor  : vec3f,
+  shininess  : f32,
+  relight    : f32, // 0 = baked color, 1 = fully relit
+};
+@group(0) @binding(1) var<uniform> lighting : Lighting;
 
 // 3x3 rotation matrix from a unit quaternion (x, y, z, w).
 fn quatToMat3(q : vec4f) -> mat3x3f {
@@ -31,12 +41,22 @@ fn quatToMat3(q : vec4f) -> mat3x3f {
   );
 }
 
+// Lambert + Blinn-Phong + ambient. `worldPos` is the splat center (flat per-splat).
+fn shade(N : vec3f, worldPos : vec3f, albedo : vec3f, camPos : vec3f) -> vec3f {
+  let L = normalize(lighting.lightPos - worldPos); // surface → light
+  let V = normalize(camPos - worldPos);            // surface → eye
+  let H = normalize(L + V);                         // halfway vector
+  let diff = max(dot(N, L), 0.0);                   // Lambert
+  let spec = pow(max(dot(N, H), 0.0), lighting.shininess); // Blinn-Phong
+  let diffuse = diff * lighting.intensity * lighting.lightColor; // vec3
+  return albedo * (vec3f(lighting.ambient) + diffuse) + spec * lighting.specColor;
+}
+
 struct VSOut {
   @builtin(position) clip    : vec4f,
   @location(0)       color   : vec3f,
   @location(1)       opacity : f32,
   @location(2)       vSigma  : vec2f, // position within the ellipse, in σ units
-  @location(3)       normal  : vec3f, // world-space surface normal (shortest axis)
 };
 
 @vertex
@@ -85,8 +105,8 @@ fn vs(
   let disc = sqrt(max(mid * mid - (a * c - b * b), 0.0));
   let lambda1 = mid + disc;
   let lambda2 = max(mid - disc, 0.0);
-  let sigma1 = sqrt(lambda1); // pixels, along major axis
-  let sigma2 = sqrt(lambda2); // pixels, along minor axis
+  let sigma1 = sqrt(lambda1);
+  let sigma2 = sqrt(lambda2);
   var e1 : vec2f;
   if (abs(b) < 1e-6) {
     e1 = select(vec2f(0.0, 1.0), vec2f(1.0, 0.0), a >= c);
@@ -96,26 +116,34 @@ fn vs(
   let e2 = vec2f(-e1.y, e1.x);
 
   // --- place the quad corner ±Kσ along each axis (pixels → clip) ---
-  let K = 3.0; // cover ±3σ (99.7% of the Gaussian)
+  let K = 3.0;
   let offsetPx = corner.x * (K * sigma1) * e1 + corner.y * (K * sigma2) * e2;
   let ndcOffset = 2.0 * offsetPx / camera.viewport;
-
   var clip = camera.viewProj * vec4f(center, 1.0);
-  clip.x += ndcOffset.x * clip.w; // shift in NDC = (offset) * w before the divide
+  clip.x += ndcOffset.x * clip.w;
   clip.y += ndcOffset.y * clip.w;
 
-  // Surface normal ≈ the covariance's shortest axis = R's column with the
-  // smallest scale. R is a rotation, so its columns are already unit length.
-  var normal = R[2];
+  // --- surface normal = shortest covariance axis, oriented outward ---
+  var normal = normalize(R[2]);
   var minScale = scale.z;
-  if (scale.x < minScale) { minScale = scale.x; normal = R[0]; }
-  if (scale.y < minScale) { minScale = scale.y; normal = R[1]; }
+  if (scale.x < minScale) { minScale = scale.x; normal = normalize(R[0]); }
+  if (scale.y < minScale) { minScale = scale.y; normal = normalize(R[1]); }
+  if (dot(normal, center - camera.objectCenter) < 0.0) { normal = -normal; }
+
+  // --- display color: normals debug, or (baked ↔ relit) shading ---
+  var displayColor = color;
+  if (camera.renderMode > 0.5) {
+    displayColor = normal * 0.5 + vec3f(0.5);
+  } else {
+    let camPos = -(transpose(W) * camera.view[3].xyz); // camera world position
+    let lit = shade(normal, center, color, camPos);
+    displayColor = mix(color, lit, lighting.relight);
+  }
 
   out.clip = clip;
-  out.color = color;
+  out.color = displayColor;
   out.opacity = opacity;
-  out.vSigma = corner * K; // in σ units → falloff below
-  out.normal = normal;
+  out.vSigma = corner * K;
   return out;
 }
 
@@ -127,9 +155,5 @@ fn fs(in : VSOut) -> @location(0) vec4f {
   if (alpha < 1.0 / 255.0) {
     discard;
   }
-  var rgb = in.color;
-  if (camera.renderMode > 0.5) {
-    rgb = normalize(in.normal) * 0.5 + vec3f(0.5); // normal (x,y,z) → RGB
-  }
-  return vec4f(rgb * alpha, alpha); // premultiplied alpha
+  return vec4f(in.color * alpha, alpha); // premultiplied alpha
 }

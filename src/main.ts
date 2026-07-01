@@ -19,6 +19,7 @@ import lineShaderSrc from './shaders/line.wgsl?raw';
 import pointsShaderSrc from './shaders/points.wgsl?raw';
 import ellipsoidShaderSrc from './shaders/ellipsoid.wgsl?raw';
 import splatShaderSrc from './shaders/splat.wgsl?raw';
+import { Pane } from 'tweakpane';
 
 // pos(3) + color(3) interleaved, all f32 — shared by the grid and point pipelines.
 const POS_COLOR_LAYOUT: GPUVertexBufferLayout = {
@@ -78,10 +79,13 @@ async function loadCloud(): Promise<SplatCloud> {
   }
 }
 
-/** Point the camera at the cloud's centroid and back off to frame its extent. */
-function fitCameraToCloud(camera: OrbitCamera, cloud: SplatCloud): void {
+/**
+ * Point the camera at the cloud's centroid and back off to frame its extent.
+ * Returns the centroid (also used to orient splat normals outward).
+ */
+function fitCameraToCloud(camera: OrbitCamera, cloud: SplatCloud): [number, number, number] {
   const n = cloud.count;
-  if (n === 0) return;
+  if (n === 0) return [0, 0, 0];
   let cx = 0;
   let cy = 0;
   let cz = 0;
@@ -108,6 +112,16 @@ function fitCameraToCloud(camera: OrbitCamera, cloud: SplatCloud): void {
   camera.distance = r * 2.2;
   camera.near = Math.max(0.001, r * 0.002);
   camera.far = Math.max(camera.far, r * 20);
+  return [cx, cy, cz];
+}
+
+/** Parse a `#rrggbb` (or `#rgb`) hex color to RGB floats in [0,1]. */
+function hexToRgb(hex: string): [number, number, number] {
+  let h = hex.replace('#', '');
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  const n = parseInt(h, 16);
+  if (Number.isNaN(n)) return [1, 1, 1];
+  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
 }
 
 async function main(): Promise<void> {
@@ -151,7 +165,7 @@ async function main(): Promise<void> {
   // Load a real captured scene (falls back to the synthetic sphere on failure),
   // then frame the camera to it.
   const cloud = await loadCloud();
-  fitCameraToCloud(camera, cloud);
+  const objectCenter = fitCameraToCloud(camera, cloud);
   const pointBuffer = createBufferWithData(
     device,
     cloudToPointVertices(cloud),
@@ -250,9 +264,60 @@ async function main(): Promise<void> {
     // Transparent: test against the grid, but don't write depth (so splats blend).
     depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: false, depthCompare: 'less' },
   });
+  // Lighting uniform + Tweakpane controls (the draggable relight).
+  const lightingData = new Float32Array(16);
+  const lightingBuffer = device.createBuffer({
+    size: lightingData.byteLength,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const d = camera.distance;
+  const lightParams = {
+    relight: 0.7,
+    intensity: 1.0,
+    ambient: 0.25,
+    shininess: 24,
+    specular: 0.25,
+    color: '#ffffff',
+    posX: objectCenter[0] + d,
+    posY: objectCenter[1] + d,
+    posZ: objectCenter[2] + d * 0.6,
+  };
+  const packLighting = (): void => {
+    const [lr, lg, lb] = hexToRgb(lightParams.color);
+    lightingData[0] = lightParams.posX;
+    lightingData[1] = lightParams.posY;
+    lightingData[2] = lightParams.posZ;
+    lightingData[3] = lightParams.intensity;
+    lightingData[4] = lr;
+    lightingData[5] = lg;
+    lightingData[6] = lb;
+    lightingData[7] = lightParams.ambient;
+    lightingData[8] = lightParams.specular;
+    lightingData[9] = lightParams.specular;
+    lightingData[10] = lightParams.specular;
+    lightingData[11] = lightParams.shininess;
+    lightingData[12] = lightParams.relight;
+    writeBuffer(device, lightingBuffer, lightingData);
+  };
+
+  const pane = new Pane({ title: 'lighting' });
+  pane.addBinding(lightParams, 'relight', { min: 0, max: 1, step: 0.01 });
+  pane.addBinding(lightParams, 'intensity', { min: 0, max: 3, step: 0.01 });
+  pane.addBinding(lightParams, 'ambient', { min: 0, max: 1, step: 0.01 });
+  pane.addBinding(lightParams, 'shininess', { min: 1, max: 128, step: 1 });
+  pane.addBinding(lightParams, 'specular', { min: 0, max: 1, step: 0.01 });
+  pane.addBinding(lightParams, 'color');
+  const lightFolder = pane.addFolder({ title: 'light position' });
+  lightFolder.addBinding(lightParams, 'posX', { min: objectCenter[0] - 3 * d, max: objectCenter[0] + 3 * d });
+  lightFolder.addBinding(lightParams, 'posY', { min: objectCenter[1] - 3 * d, max: objectCenter[1] + 3 * d });
+  lightFolder.addBinding(lightParams, 'posZ', { min: objectCenter[2] - 3 * d, max: objectCenter[2] + 3 * d });
+
   const splatBindGroup = device.createBindGroup({
     layout: splatPipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
+    entries: [
+      { binding: 0, resource: { buffer: cameraBuffer } },
+      { binding: 1, resource: { buffer: lightingBuffer } },
+    ],
   });
 
   // View cycle: 'v' rotates through the 2D splats, the 3D ellipsoids, and points.
@@ -351,15 +416,21 @@ async function main(): Promise<void> {
     const focal = (0.5 * canvas.height) / Math.tan(0.5 * camera.fovY);
     cameraData.set(viewProj, 0);
     cameraData.set(camera.viewMatrix, 16);
-    cameraData[32] = focal;
-    cameraData[33] = focal;
-    cameraData[34] = canvas.width;
-    cameraData[35] = canvas.height;
-    cameraData[36] = view === 'normals' ? 1 : 0; // renderMode
+    cameraData[32] = objectCenter[0];
+    cameraData[33] = objectCenter[1];
+    cameraData[34] = objectCenter[2];
+    cameraData[35] = view === 'normals' ? 1 : 0; // renderMode
+    cameraData[36] = focal;
+    cameraData[37] = focal;
+    cameraData[38] = canvas.width;
+    cameraData[39] = canvas.height;
     writeBuffer(device, cameraBuffer, cameraData);
 
     const drawSplats = view === 'splats' || view === 'normals';
-    if (drawSplats) sortSplats();
+    if (drawSplats) {
+      sortSplats();
+      packLighting();
+    }
 
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
