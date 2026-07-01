@@ -167,9 +167,10 @@ async function main(): Promise<void> {
     GPUBufferUsage.VERTEX,
     'splat-quad',
   );
+  const splatInstances = cloudToSplatInstances(cloud);
   const splatInstanceBuffer = createBufferWithData(
     device,
-    cloudToSplatInstances(cloud),
+    splatInstances,
     GPUBufferUsage.VERTEX,
     'splat-instances-2d',
   );
@@ -211,6 +212,45 @@ async function main(): Promise<void> {
     if (e.key === 'v' || e.key === 'V') viewIndex = (viewIndex + 1) % VIEWS.length;
   });
 
+  // [concept] Depth sort: "over" blending is order-dependent, so splats must be
+  // drawn back-to-front. Sort by camera-space depth and rewrite the instance
+  // buffer in that order. Only re-sorts when the camera actually moved.
+  const SPLAT_FLOATS = 14;
+  const order = new Uint32Array(cloud.count);
+  for (let i = 0; i < cloud.count; i++) order[i] = i;
+  const depths = new Float32Array(cloud.count);
+  const sortedInstances = new Float32Array(splatInstances.length);
+  let lastSortKey = '';
+
+  const sortSplats = (): void => {
+    const key = `${camera.azimuth}|${camera.elevation}|${camera.distance}|${camera.target[0]}|${camera.target[1]}|${camera.target[2]}`;
+    if (key === lastSortKey) return;
+    lastSortKey = key;
+
+    // Camera-space z of each center = row 2 of the view matrix · (x,y,z,1).
+    // Front is z < 0, so ascending z = farthest first = back-to-front.
+    const m = camera.viewMatrix;
+    for (let i = 0; i < cloud.count; i++) {
+      const p = i * 3;
+      depths[i] =
+        m[2] * cloud.positions[p] +
+        m[6] * cloud.positions[p + 1] +
+        m[10] * cloud.positions[p + 2] +
+        m[14];
+    }
+    order.sort((a, b) => depths[a] - depths[b]);
+
+    // Gather the instance data into sorted order and upload.
+    for (let i = 0; i < cloud.count; i++) {
+      const src = order[i] * SPLAT_FLOATS;
+      const dst = i * SPLAT_FLOATS;
+      for (let k = 0; k < SPLAT_FLOATS; k++) {
+        sortedInstances[dst + k] = splatInstances[src + k];
+      }
+    }
+    writeBuffer(device, splatInstanceBuffer, sortedInstances);
+  };
+
   // Depth texture is recreated whenever the canvas backing size changes.
   let depthTexture: GPUTexture | null = null;
   const ensureSize = (): void => {
@@ -239,6 +279,8 @@ async function main(): Promise<void> {
     cameraData[34] = canvas.width;
     cameraData[35] = canvas.height;
     writeBuffer(device, cameraBuffer, cameraData);
+
+    if (VIEWS[viewIndex] === 'splats') sortSplats();
 
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({

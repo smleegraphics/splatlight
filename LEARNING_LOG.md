@@ -50,5 +50,9 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 
 **Built:** the real 2D splat pipeline (`splat.wgsl`) with EWA projection + Gaussian falloff + alpha blending, rendered **unsorted** on purpose so the blending artifacts motivate sorting. `v` now cycles splats / ellipsoids / points.
 
+**Depth sorting (same session):** "Over" blending is order-dependent (A-over-B ≠ B-over-A), so splats must be composited **back-to-front**. Opaque geometry sidesteps this with the depth buffer (nearest wins, order irrelevant); transparent splats accumulate many contributions per pixel and need explicit ordering. Sort key = camera-space depth; because moving the camera changes every splat's depth, it must re-sort constantly → the **performance bottleneck** (GPU radix sort is the scaling fix). Implemented a CPU sort that reorders the instance buffer whenever the camera moves.
+
+**Also learned:** EWA = **Elliptical Weighted Average** (Heckbert 1989 texture filtering → Zwicker et al. surface splatting → 3DGS); the "elliptical" is the screen-space `Σ'` footprint, the "weighted average" is the Gaussian falloff.
+
 **Open questions to revisit:**
-- Why does transparent blending require back-to-front depth sorting, and why is the sort the performance bottleneck? (Phase 1 — next)
+- How is view-dependent color (spherical harmonics) evaluated per frame, and how do we get real SH data (a `.ply`) into the renderer? (Phase 1 — last concept)
