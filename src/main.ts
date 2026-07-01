@@ -126,8 +126,9 @@ async function main(): Promise<void> {
     'grid-vertices',
   );
 
-  // Camera uniform: viewProj(16) + view(16) + focal(2) + viewport(2) = 36 floats.
-  const cameraData = new Float32Array(36);
+  // Camera uniform: viewProj(16) + view(16) + focal(2) + viewport(2) + renderMode(1)
+  // + padding = 40 floats.
+  const cameraData = new Float32Array(40);
   const cameraBuffer = device.createBuffer({
     size: cameraData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -255,7 +256,7 @@ async function main(): Promise<void> {
   });
 
   // View cycle: 'v' rotates through the 2D splats, the 3D ellipsoids, and points.
-  const VIEWS = ['splats', 'ellipsoids', 'points'] as const;
+  const VIEWS = ['splats', 'normals', 'ellipsoids', 'points'] as const;
   let viewIndex = 0;
   window.addEventListener('keydown', (e) => {
     if (e.key === 'v' || e.key === 'V') viewIndex = (viewIndex + 1) % VIEWS.length;
@@ -345,6 +346,7 @@ async function main(): Promise<void> {
 
   const frame = (): void => {
     ensureSize();
+    const view = VIEWS[viewIndex];
     const viewProj = camera.update(canvas.width / canvas.height);
     const focal = (0.5 * canvas.height) / Math.tan(0.5 * camera.fovY);
     cameraData.set(viewProj, 0);
@@ -353,9 +355,11 @@ async function main(): Promise<void> {
     cameraData[33] = focal;
     cameraData[34] = canvas.width;
     cameraData[35] = canvas.height;
+    cameraData[36] = view === 'normals' ? 1 : 0; // renderMode
     writeBuffer(device, cameraBuffer, cameraData);
 
-    if (VIEWS[viewIndex] === 'splats') sortSplats();
+    const drawSplats = view === 'splats' || view === 'normals';
+    if (drawSplats) sortSplats();
 
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
@@ -380,8 +384,7 @@ async function main(): Promise<void> {
     pass.setVertexBuffer(0, vertexBuffer);
     pass.draw(grid.vertexCount);
 
-    const view = VIEWS[viewIndex];
-    if (view === 'splats') {
+    if (drawSplats) {
       pass.setPipeline(splatPipeline);
       pass.setBindGroup(0, splatBindGroup);
       pass.setVertexBuffer(0, quadBuffer);

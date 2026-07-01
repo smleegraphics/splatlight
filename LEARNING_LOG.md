@@ -60,3 +60,21 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 
 **Open questions to revisit:**
 - How is higher-order SH evaluated per view direction to make color view-dependent, and what full-SH scene do we test it on? (Phase 1 — last concept; luigi is DC-only, so we need a fabricated or full-SH example to *see* it.)
+
+---
+
+## Session 3 — Phase 2 start: normals from the covariance
+
+**Concept covered:** Per-splat normal from the covariance's shortest axis (syllabus #7).
+
+**Key insight (plain language):** Neither the file nor the format stores usable normals, so we recover one. A splat that lands on a surface gets **flattened against it** (a thin disk), so its **shortest axis points perpendicular to the surface = the normal**. And it's cheap to read: since `Σ = R S² Rᵀ`, the shortest axis is just **`R`'s column with the smallest scale** — no eigen-decomposition needed (columns of R = axes, scales = lengths).
+
+**The catch — sign ambiguity:** the shortest axis is a **line, not an arrow**; nothing says whether it points out of or into the surface. So per-splat it's arbitrarily flipped, which shows up in the normals-as-RGB debug view as **rainbow speckle / opposite-color patches**. Covariance normals are also just noisier on rounder splats (PLAN §5 risk).
+
+**Debug viz built:** a `normals` view (in the `v` cycle) — colors each splat by `normal·0.5+0.5`, computed in `splat.wgsl` from the min-scale column of `R`, toggled via a `renderMode` flag in the camera uniform.
+
+**Honest framing:** the eventual relight is approximate because the SH/DC color already has the capture lighting baked in.
+
+**Open questions to revisit:**
+- How do we disambiguate the normal sign (flip to face the camera? enforce neighbor consistency?) — next.
+- The Blinn-Phong shading math and blending relit vs. baked color.

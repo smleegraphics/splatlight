@@ -10,10 +10,11 @@
 // evaluates the 2D Gaussian falloff × opacity → alpha.
 
 struct Camera {
-  viewProj : mat4x4f,
-  view     : mat4x4f,
-  focal    : vec2f, // pixels
-  viewport : vec2f, // pixels (width, height)
+  viewProj   : mat4x4f,
+  view       : mat4x4f,
+  focal      : vec2f, // pixels
+  viewport   : vec2f, // pixels (width, height)
+  renderMode : f32,   // 0 = SH color, 1 = normals-as-RGB debug
 };
 @group(0) @binding(0) var<uniform> camera : Camera;
 
@@ -35,6 +36,7 @@ struct VSOut {
   @location(0)       color   : vec3f,
   @location(1)       opacity : f32,
   @location(2)       vSigma  : vec2f, // position within the ellipse, in σ units
+  @location(3)       normal  : vec3f, // world-space surface normal (shortest axis)
 };
 
 @vertex
@@ -102,10 +104,18 @@ fn vs(
   clip.x += ndcOffset.x * clip.w; // shift in NDC = (offset) * w before the divide
   clip.y += ndcOffset.y * clip.w;
 
+  // Surface normal ≈ the covariance's shortest axis = R's column with the
+  // smallest scale. R is a rotation, so its columns are already unit length.
+  var normal = R[2];
+  var minScale = scale.z;
+  if (scale.x < minScale) { minScale = scale.x; normal = R[0]; }
+  if (scale.y < minScale) { minScale = scale.y; normal = R[1]; }
+
   out.clip = clip;
   out.color = color;
   out.opacity = opacity;
   out.vSigma = corner * K; // in σ units → falloff below
+  out.normal = normal;
   return out;
 }
 
@@ -117,5 +127,9 @@ fn fs(in : VSOut) -> @location(0) vec4f {
   if (alpha < 1.0 / 255.0) {
     discard;
   }
-  return vec4f(in.color * alpha, alpha); // premultiplied alpha
+  var rgb = in.color;
+  if (camera.renderMode > 0.5) {
+    rgb = normalize(in.normal) * 0.5 + vec3f(0.5); // normal (x,y,z) → RGB
+  }
+  return vec4f(rgb * alpha, alpha); // premultiplied alpha
 }
