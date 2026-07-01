@@ -213,12 +213,15 @@ async function main(): Promise<void> {
   });
 
   // [concept] Depth sort: "over" blending is order-dependent, so splats must be
-  // drawn back-to-front. Sort by camera-space depth and rewrite the instance
-  // buffer in that order. Only re-sorts when the camera actually moved.
+  // drawn back-to-front. We quantize each splat's camera-space depth to a 16-bit
+  // bucket and counting-sort — O(n) with no per-comparison function calls — then
+  // rewrite the instance buffer in that order. Only re-sorts when the camera moved.
   const SPLAT_FLOATS = 14;
+  const NUM_BUCKETS = 65536; // 16-bit depth quantization
   const order = new Uint32Array(cloud.count);
-  for (let i = 0; i < cloud.count; i++) order[i] = i;
   const depths = new Float32Array(cloud.count);
+  const buckets = new Uint16Array(cloud.count);
+  const counts = new Uint32Array(NUM_BUCKETS);
   const sortedInstances = new Float32Array(splatInstances.length);
   let lastSortKey = '';
 
@@ -227,20 +230,43 @@ async function main(): Promise<void> {
     if (key === lastSortKey) return;
     lastSortKey = key;
 
-    // Camera-space z of each center = row 2 of the view matrix · (x,y,z,1).
-    // Front is z < 0, so ascending z = farthest first = back-to-front.
+    // 1. Camera-space z per splat (row 2 of the view matrix), tracking the range.
     const m = camera.viewMatrix;
+    let min = Infinity;
+    let max = -Infinity;
     for (let i = 0; i < cloud.count; i++) {
       const p = i * 3;
-      depths[i] =
+      const z =
         m[2] * cloud.positions[p] +
         m[6] * cloud.positions[p + 1] +
         m[10] * cloud.positions[p + 2] +
         m[14];
+      depths[i] = z;
+      if (z < min) min = z;
+      if (z > max) max = z;
     }
-    order.sort((a, b) => depths[a] - depths[b]);
 
-    // Gather the instance data into sorted order and upload.
+    // 2. Quantize depth → 16-bit bucket. Front is z<0, so smaller z (smaller
+    //    bucket) = farther = drawn first = back-to-front.
+    const scale = max > min ? (NUM_BUCKETS - 1) / (max - min) : 0;
+    for (let i = 0; i < cloud.count; i++) {
+      buckets[i] = Math.min(NUM_BUCKETS - 1, ((depths[i] - min) * scale) | 0);
+    }
+
+    // 3. Counting sort into `order` — no comparisons.
+    counts.fill(0);
+    for (let i = 0; i < cloud.count; i++) counts[buckets[i]]++; // tally per bucket
+    let running = 0; // prefix sum → each bucket's start offset
+    for (let b = 0; b < NUM_BUCKETS; b++) {
+      const c = counts[b];
+      counts[b] = running;
+      running += c;
+    }
+    for (let i = 0; i < cloud.count; i++) {
+      order[counts[buckets[i]]++] = i; // place splat i, advance its bucket's slot
+    }
+
+    // 4. Gather the instance data into sorted order and upload.
     for (let i = 0; i < cloud.count; i++) {
       const src = order[i] * SPLAT_FLOATS;
       const dst = i * SPLAT_FLOATS;
