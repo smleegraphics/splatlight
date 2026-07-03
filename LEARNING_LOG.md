@@ -81,6 +81,9 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 
 **Gotcha logged:** WGSL has no scalar→vector broadcast for `+`/`-` (only `*`/`/`), and no unary minus on matrices — both blanked the whole render pass (grid included) until fixed.
 
+**Phase 2 checkpoint — PASSED:** can explain (1) normals come from the **flattened-splat shortest covariance axis** (`R`'s smallest-scale column, flipped to point outward), and (2) the relight is **approximate** because the capture's lighting is *fused into* the SH/DC color and can't be separated (that separation is inverse rendering, which we skip), and because the normals are an estimated heuristic — noisy, wrong in concave spots, and object-only (a full scene needs neighbor-propagation or learned normals, since there's no single centroid). Build milestone (draggable relight) hit.
+
 **Open questions to revisit:**
 - If the relit result is too grainy, add neighbor-based **normal smoothing** (needs a spatial grid).
-- Directional "sun" light, lighting presets, tone mapping, and optional HDRI IBL (Phase 2/3 polish).
+- Directional "sun" light, lighting presets, tone mapping, and optional HDRI IBL (Phase 3 polish).
+- Loading full-SH `.ply` (or the user's own capture) to finally show view-dependent SH color.
