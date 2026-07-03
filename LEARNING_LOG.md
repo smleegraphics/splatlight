@@ -60,3 +60,30 @@ Why this is "enough": the blobs cooperate like pointillism dots — no single on
 
 **Open questions to revisit:**
 - How is higher-order SH evaluated per view direction to make color view-dependent, and what full-SH scene do we test it on? (Phase 1 — last concept; luigi is DC-only, so we need a fabricated or full-SH example to *see* it.)
+
+---
+
+## Session 3 — Phase 2 start: normals from the covariance
+
+**Concept covered:** Per-splat normal from the covariance's shortest axis (syllabus #7).
+
+**Key insight (plain language):** Neither the file nor the format stores usable normals, so we recover one. A splat that lands on a surface gets **flattened against it** (a thin disk), so its **shortest axis points perpendicular to the surface = the normal**. And it's cheap to read: since `Σ = R S² Rᵀ`, the shortest axis is just **`R`'s column with the smallest scale** — no eigen-decomposition needed (columns of R = axes, scales = lengths).
+
+**The catch — sign ambiguity:** the shortest axis is a **line, not an arrow**; nothing says whether it points out of or into the surface. So per-splat it's arbitrarily flipped, which shows up in the normals-as-RGB debug view as **rainbow speckle / opposite-color patches**. Covariance normals are also just noisier on rounder splats (PLAN §5 risk).
+
+**Debug viz built:** a `normals` view (in the `v` cycle) — colors each splat by `normal·0.5+0.5`, computed in `splat.wgsl` from the min-scale column of `R`, toggled via a `renderMode` flag in the camera uniform.
+
+**Honest framing:** the eventual relight is approximate because the SH/DC color already has the capture lighting baked in.
+
+**Sign disambiguation (same session):** the shortest axis is a line, not an arrow. We flip each normal to point **away from the object centroid** — view-independent and right for an object-centric capture. (Camera-facing is simplest but makes lighting *swim* with the camera; neighbor-consistency is robust but complex.) This fixes the coarse in/out flips (torso now one color) but leaves residual noise: covariance normals are genuinely noisy on rounder splats, and the centroid trick is wrong in concave regions.
+
+**Shading (same session):** Lambert `max(dot(N,L),0)` + Blinn-Phong `pow(max(dot(N,H),0), shininess)` + ambient, driven by a Tweakpane point light (position/color/intensity/ambient/shininess/specular). The honest **baked↔relit** blend is `mix(bakedColor, lit, relight)` — we can't remove the SH-baked lighting, so relight is an artistic dial, not physical delighting. Shading is per-splat (flat), computed in the vertex shader.
+
+**Gotcha logged:** WGSL has no scalar→vector broadcast for `+`/`-` (only `*`/`/`), and no unary minus on matrices — both blanked the whole render pass (grid included) until fixed.
+
+**Phase 2 checkpoint — PASSED:** can explain (1) normals come from the **flattened-splat shortest covariance axis** (`R`'s smallest-scale column, flipped to point outward), and (2) the relight is **approximate** because the capture's lighting is *fused into* the SH/DC color and can't be separated (that separation is inverse rendering, which we skip), and because the normals are an estimated heuristic — noisy, wrong in concave spots, and object-only (a full scene needs neighbor-propagation or learned normals, since there's no single centroid). Build milestone (draggable relight) hit.
+
+**Open questions to revisit:**
+- If the relit result is too grainy, add neighbor-based **normal smoothing** (needs a spatial grid).
+- Directional "sun" light, lighting presets, tone mapping, and optional HDRI IBL (Phase 3 polish).
+- Loading full-SH `.ply` (or the user's own capture) to finally show view-dependent SH color.
