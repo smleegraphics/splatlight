@@ -25,6 +25,7 @@ struct Lighting {
   specColor  : vec3f,
   shininess  : f32,
   relight    : f32, // 0 = baked color, 1 = fully relit
+  normalMode : f32, // 0 = object (away from centroid), 1 = scene (face camera)
 };
 @group(0) @binding(1) var<uniform> lighting : Lighting;
 
@@ -123,19 +124,28 @@ fn vs(
   clip.x += ndcOffset.x * clip.w;
   clip.y += ndcOffset.y * clip.w;
 
-  // --- surface normal = shortest covariance axis, oriented outward ---
+  // Camera world position (for camera-facing normals and specular).
+  let camPos = -(transpose(W) * camera.view[3].xyz);
+
+  // --- surface normal = shortest covariance axis, oriented consistently ---
   var normal = normalize(R[2]);
   var minScale = scale.z;
   if (scale.x < minScale) { minScale = scale.x; normal = normalize(R[0]); }
   if (scale.y < minScale) { minScale = scale.y; normal = normalize(R[1]); }
-  if (dot(normal, center - camera.objectCenter) < 0.0) { normal = -normal; }
+  // Sign disambiguation. Object mode: point away from the scene centroid
+  // (view-independent, good for one convex object). Scene mode: face the camera
+  // (works on any scene — no single centroid — but the lit side drifts as you orbit).
+  if (lighting.normalMode > 0.5) {
+    if (dot(normal, camPos - center) < 0.0) { normal = -normal; }
+  } else {
+    if (dot(normal, center - camera.objectCenter) < 0.0) { normal = -normal; }
+  }
 
   // --- display color: normals debug, or (baked ↔ relit) shading ---
   var displayColor = color;
   if (camera.renderMode > 0.5) {
     displayColor = normal * 0.5 + vec3f(0.5);
   } else {
-    let camPos = -(transpose(W) * camera.view[3].xyz); // camera world position
     let lit = shade(normal, center, color, camPos);
     displayColor = mix(color, lit, lighting.relight);
   }
