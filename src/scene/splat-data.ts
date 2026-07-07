@@ -135,6 +135,38 @@ export function cloudToInstanceData(cloud: SplatCloud): Float32Array {
 }
 
 /**
+ * Drop near-transparent splats (the mkkellogg `splatAlphaRemovalThreshold`
+ * pattern). Cleans low-opacity / NaN-guarded junk and trims the count. Returns
+ * the same cloud unchanged if nothing is below the threshold.
+ */
+export function filterByOpacity(cloud: SplatCloud, minAlpha = 0.02): SplatCloud {
+  const keep: number[] = [];
+  for (let i = 0; i < cloud.count; i++) {
+    if (cloud.opacities[i] >= minAlpha) keep.push(i);
+  }
+  if (keep.length === cloud.count) return cloud;
+
+  const m = keep.length;
+  const positions = new Float32Array(m * 3);
+  const scales = new Float32Array(m * 3);
+  const rotations = new Float32Array(m * 4);
+  const opacities = new Float32Array(m);
+  const colors = new Float32Array(m * 3);
+  for (let j = 0; j < m; j++) {
+    const i = keep[j];
+    for (let k = 0; k < 3; k++) {
+      positions[j * 3 + k] = cloud.positions[i * 3 + k];
+      scales[j * 3 + k] = cloud.scales[i * 3 + k];
+      colors[j * 3 + k] = cloud.colors[i * 3 + k];
+    }
+    for (let k = 0; k < 4; k++) rotations[j * 4 + k] = cloud.rotations[i * 4 + k];
+    opacities[j] = cloud.opacities[i];
+  }
+  console.log(`Opacity filter: kept ${m} / ${cloud.count} splats`);
+  return { count: m, positions, scales, rotations, opacities, colors };
+}
+
+/**
  * Per-instance data for the 2D splat (billboard) pipeline: 14 floats per splat =
  * center(3) + scale(3) + quaternion as (x,y,z,w) (4) + color(3) + opacity(1).
  * Opacity is needed here because the fragment falloff multiplies by it.

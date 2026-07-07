@@ -29,6 +29,10 @@ struct Lighting {
 };
 @group(0) @binding(1) var<uniform> lighting : Lighting;
 
+// All splats, static (14 floats each: center3, scale3, quat4, color3, opacity1).
+// The sort reorders a small index buffer instead of this, so this never re-uploads.
+@group(0) @binding(2) var<storage, read> splatData : array<f32>;
+
 // 3x3 rotation matrix from a unit quaternion (x, y, z, w).
 fn quatToMat3(q : vec4f) -> mat3x3f {
   let x = q.x; let y = q.y; let z = q.z; let w = q.w;
@@ -62,14 +66,18 @@ struct VSOut {
 
 @vertex
 fn vs(
-  @location(0) corner  : vec2f, // quad corner in [-1, 1]
-  @location(1) center  : vec3f,
-  @location(2) scale   : vec3f,
-  @location(3) quat    : vec4f,
-  @location(4) color   : vec3f,
-  @location(5) opacity : f32,
+  @location(0) corner     : vec2f, // quad corner in [-1, 1]
+  @location(1) splatIndex : u32,   // which splat this instance draws (from the sort)
 ) -> VSOut {
   var out : VSOut;
+
+  // Fetch this splat's data from the static storage buffer.
+  let base = splatIndex * 14u;
+  let center  = vec3f(splatData[base + 0u], splatData[base + 1u], splatData[base + 2u]);
+  let scale   = vec3f(splatData[base + 3u], splatData[base + 4u], splatData[base + 5u]);
+  let quat    = vec4f(splatData[base + 6u], splatData[base + 7u], splatData[base + 8u], splatData[base + 9u]);
+  let color   = vec3f(splatData[base + 10u], splatData[base + 11u], splatData[base + 12u]);
+  let opacity = splatData[base + 13u];
 
   // --- 3D covariance Σ = (R S)(R S)ᵀ = R S² Rᵀ, in world space ---
   let R = quatToMat3(quat);
@@ -117,8 +125,13 @@ fn vs(
   let e2 = vec2f(-e1.y, e1.x);
 
   // --- place the quad corner ±Kσ along each axis (pixels → clip) ---
+  // Clamp the on-screen size so a few oversized/junk splats can't wash out the
+  // whole view (the antimatter15 `min(axis, …)` trick), viewport-relative.
   let K = 3.0;
-  let offsetPx = corner.x * (K * sigma1) * e1 + corner.y * (K * sigma2) * e2;
+  let maxSigma = 0.15 * min(camera.viewport.x, camera.viewport.y);
+  let s1 = min(sigma1, maxSigma);
+  let s2 = min(sigma2, maxSigma);
+  let offsetPx = corner.x * (K * s1) * e1 + corner.y * (K * s2) * e2;
   let ndcOffset = 2.0 * offsetPx / camera.viewport;
   var clip = camera.viewProj * vec4f(center, 1.0);
   clip.x += ndcOffset.x * clip.w;
