@@ -11,6 +11,7 @@ import {
   cloudToInstanceData,
   cloudToSplatInstances,
   filterByOpacity,
+  flipCloudUpright,
 } from './scene/splat-data';
 import { makeUnitSphere } from './scene/unit-sphere';
 import { parsePly } from './scene/ply-parser';
@@ -281,22 +282,37 @@ async function main(): Promise<void> {
     };
   };
 
-  let scene = buildScene(await loadCloud());
+  // Keep the cloud as loaded so the "flip up" orientation toggle can be applied
+  // or removed without re-parsing (exporters disagree on the up-axis).
+  let rawCloud = await loadCloud();
+  const orientation = { flipUp: false };
+  let refreshUI = (): void => {}; // reassigned once the pane exists (syncs the checkbox)
+  const orientedCloud = (): SplatCloud => (orientation.flipUp ? flipCloudUpright(rawCloud) : rawCloud);
+  let scene = buildScene(orientedCloud());
   let lastSortKey = '';
 
-  const loadIntoScene = (cloud: SplatCloud): void => {
+  const rebuildScene = (): void => {
     scene.pointBuffer.destroy();
     scene.instanceBuffer.destroy();
     scene.splatDataBuffer.destroy();
     scene.indexBuffer.destroy();
-    scene = buildScene(cloud);
+    scene = buildScene(orientedCloud());
     lastSortKey = '';
+  };
+
+  const loadIntoScene = (cloud: SplatCloud): void => {
+    rawCloud = cloud;
+    rebuildScene();
   };
 
   // Load a .ply by dragging it onto the window, or via the panel button below.
   const loadFile = async (file: File): Promise<void> => {
     try {
+      // User files default to the raw COLMAP convention (flip to Y-up), so most
+      // scans load upright; the bundled Luigi is already Y-up. Toggle overrides.
+      orientation.flipUp = true;
       loadIntoScene(filterByOpacity(parsePly(await file.arrayBuffer())));
+      refreshUI();
       console.log(`Loaded ${file.name}: ${scene.cloud.count} splats`);
     } catch (err) {
       console.error(`Failed to load ${file.name}:`, err);
@@ -355,6 +371,7 @@ async function main(): Promise<void> {
 
   const pane = new Pane({ title: 'lighting' });
   pane.addButton({ title: 'load .ply…' }).on('click', () => fileInput.click());
+  pane.addBinding(orientation, 'flipUp', { label: 'flip up' }).on('change', rebuildScene);
   pane.addBinding(lightParams, 'relight', { min: 0, max: 1, step: 0.01 });
   pane.addBinding(lightParams, 'intensity', { min: 0, max: 3, step: 0.01 });
   pane.addBinding(lightParams, 'ambient', { min: 0, max: 1, step: 0.01 });
@@ -369,6 +386,10 @@ async function main(): Promise<void> {
   lightFolder.addBinding(lightParams, 'offX', { min: -4, max: 4, step: 0.05 });
   lightFolder.addBinding(lightParams, 'offY', { min: -4, max: 4, step: 0.05 });
   lightFolder.addBinding(lightParams, 'offZ', { min: -4, max: 4, step: 0.05 });
+
+  refreshUI = (): void => {
+    pane.refresh();
+  };
 
   // View cycle: 'v' rotates through splats / normals / ellipsoids / points.
   const VIEWS = ['splats', 'normals', 'ellipsoids', 'points'] as const;
