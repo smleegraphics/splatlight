@@ -135,6 +135,31 @@ export function cloudToInstanceData(cloud: SplatCloud): Float32Array {
 }
 
 /**
+ * Rotate a cloud 180° about the X axis (upside-down → upright). This is a proper
+ * rotation (not a mirror), so it fixes the common exporter up-axis mismatch
+ * without flipping the object's handedness. Positions: (x, −y, −z). Each splat's
+ * quaternion q → qflip ⊗ q with qflip = 180°-about-X = (w,x,y,z) = (0,1,0,0).
+ */
+export function flipCloudUpright(cloud: SplatCloud): SplatCloud {
+  const n = cloud.count;
+  const positions = new Float32Array(cloud.positions);
+  const rotations = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    positions[i * 3 + 1] = -positions[i * 3 + 1];
+    positions[i * 3 + 2] = -positions[i * 3 + 2];
+    const w = cloud.rotations[i * 4 + 0];
+    const x = cloud.rotations[i * 4 + 1];
+    const y = cloud.rotations[i * 4 + 2];
+    const z = cloud.rotations[i * 4 + 3];
+    rotations[i * 4 + 0] = -x; // (0,1,0,0) ⊗ (w,x,y,z)
+    rotations[i * 4 + 1] = w;
+    rotations[i * 4 + 2] = -z;
+    rotations[i * 4 + 3] = y;
+  }
+  return { count: n, positions, scales: cloud.scales, rotations, opacities: cloud.opacities, colors: cloud.colors };
+}
+
+/**
  * Drop near-transparent splats (the mkkellogg `splatAlphaRemovalThreshold`
  * pattern). Cleans low-opacity / NaN-guarded junk and trims the count. Returns
  * the same cloud unchanged if nothing is below the threshold.
