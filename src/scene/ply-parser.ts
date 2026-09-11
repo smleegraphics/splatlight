@@ -84,7 +84,9 @@ export function parsePly(buffer: ArrayBuffer): SplatCloud {
     colors[v * 3 + 1] = clamp01(0.5 + SH_C0 * f(v, iDc1));
     colors[v * 3 + 2] = clamp01(0.5 + SH_C0 * f(v, iDc2));
 
-    opacities[v] = sigmoid(f(v, iOp));
+    // Some exporters emit non-finite opacity for junk splats; hide those.
+    const op = sigmoid(f(v, iOp));
+    opacities[v] = Number.isFinite(op) ? op : 0;
 
     scales[v * 3 + 0] = Math.exp(f(v, iS0));
     scales[v * 3 + 1] = Math.exp(f(v, iS1));
