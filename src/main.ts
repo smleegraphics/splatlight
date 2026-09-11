@@ -1,6 +1,5 @@
-// [plumbing] Entry point: initialise WebGPU, build the line pipeline for the
-// reference grid, and run the render loop driven by the orbit camera. As phases
-// progress, the splat pipeline gets added alongside this grid.
+// [plumbing] Entry point: init WebGPU, build the pipelines once, load a splat
+// scene (default .ply, or one you drag-and-drop / pick), and run the render loop.
 
 import { initWebGPU } from './gpu/context';
 import { createBufferWithData, writeBuffer } from './gpu/buffers';
@@ -64,6 +63,8 @@ const SPLAT_INSTANCE_LAYOUT: GPUVertexBufferLayout = {
 };
 
 const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
+const SPLAT_FLOATS = 14;
+const NUM_BUCKETS = 65536; // 16-bit depth quantization
 
 /** Fetch + parse the default .ply scene; fall back to the synthetic sphere. */
 async function loadCloud(): Promise<SplatCloud> {
@@ -79,13 +80,13 @@ async function loadCloud(): Promise<SplatCloud> {
   }
 }
 
-/**
- * Point the camera at the cloud's centroid and back off to frame its extent.
- * Returns the centroid (also used to orient splat normals outward).
- */
-function fitCameraToCloud(camera: OrbitCamera, cloud: SplatCloud): [number, number, number] {
+/** Frame the camera to the cloud; return its centroid + bounding radius. */
+function fitCameraToCloud(
+  camera: OrbitCamera,
+  cloud: SplatCloud,
+): { center: [number, number, number]; radius: number } {
   const n = cloud.count;
-  if (n === 0) return [0, 0, 0];
+  if (n === 0) return { center: [0, 0, 0], radius: 1 };
   let cx = 0;
   let cy = 0;
   let cz = 0;
@@ -106,13 +107,14 @@ function fitCameraToCloud(camera: OrbitCamera, cloud: SplatCloud): [number, numb
     );
     if (d > r) r = d;
   }
+  r = r > 0 ? r : 1;
   camera.target[0] = cx;
   camera.target[1] = cy;
   camera.target[2] = cz;
   camera.distance = r * 2.2;
   camera.near = Math.max(0.001, r * 0.002);
   camera.far = Math.max(camera.far, r * 20);
-  return [cx, cy, cz];
+  return { center: [cx, cy, cz], radius: r };
 }
 
 /** Parse a `#rrggbb` (or `#rgb`) hex color to RGB floats in [0,1]. */
@@ -124,6 +126,21 @@ function hexToRgb(hex: string): [number, number, number] {
   return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
 }
 
+/** GPU/CPU state that depends on the loaded cloud (rebuilt on load). */
+interface Scene {
+  cloud: SplatCloud;
+  center: [number, number, number];
+  radius: number;
+  pointBuffer: GPUBuffer;
+  instanceBuffer: GPUBuffer; // ellipsoid view
+  splatInstanceBuffer: GPUBuffer; // 2D splats (reordered by the sort)
+  splatInstances: Float32Array;
+  order: Uint32Array;
+  depths: Float32Array;
+  buckets: Uint16Array;
+  sortedInstances: Float32Array;
+}
+
 async function main(): Promise<void> {
   const canvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
   const { device, context, format } = await initWebGPU(canvas);
@@ -131,47 +148,32 @@ async function main(): Promise<void> {
   const camera = new OrbitCamera();
   camera.attach(canvas);
 
-  // Reference grid geometry → vertex buffer.
-  const grid = makeReferenceGrid();
-  const vertexBuffer = createBufferWithData(
-    device,
-    grid.vertices,
-    GPUBufferUsage.VERTEX,
-    'grid-vertices',
-  );
+  // --- cloud-independent resources (built once) ---
 
-  // Camera uniform: viewProj(16) + view(16) + focal(2) + viewport(2) + renderMode(1)
-  // + padding = 40 floats.
+  const grid = makeReferenceGrid();
+  const vertexBuffer = createBufferWithData(device, grid.vertices, GPUBufferUsage.VERTEX, 'grid-vertices');
+
+  // Camera uniform: viewProj(16) + view(16) + objectCenter(3) + renderMode(1) +
+  // focal(2) + viewport(2) = 40 floats.
   const cameraData = new Float32Array(40);
   const cameraBuffer = device.createBuffer({
     size: cameraData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  const shaderModule = device.createShaderModule({ code: lineShaderSrc });
-  const pipeline = device.createRenderPipeline({
+  const lineModule = device.createShaderModule({ code: lineShaderSrc });
+  const gridPipeline = device.createRenderPipeline({
     layout: 'auto',
-    vertex: { module: shaderModule, entryPoint: 'vs', buffers: [POS_COLOR_LAYOUT] },
-    fragment: { module: shaderModule, entryPoint: 'fs', targets: [{ format }] },
+    vertex: { module: lineModule, entryPoint: 'vs', buffers: [POS_COLOR_LAYOUT] },
+    fragment: { module: lineModule, entryPoint: 'fs', targets: [{ format }] },
     primitive: { topology: 'line-list' },
     depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
   });
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
+  const gridBindGroup = device.createBindGroup({
+    layout: gridPipeline.getBindGroupLayout(0),
     entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
   });
 
-  // Load a real captured scene (falls back to the synthetic sphere on failure),
-  // then frame the camera to it.
-  const cloud = await loadCloud();
-  const objectCenter = fitCameraToCloud(camera, cloud);
-  const pointBuffer = createBufferWithData(
-    device,
-    cloudToPointVertices(cloud),
-    GPUBufferUsage.VERTEX,
-    'splat-points',
-  );
   const pointsModule = device.createShaderModule({ code: pointsShaderSrc });
   const pointsPipeline = device.createRenderPipeline({
     layout: 'auto',
@@ -185,35 +187,13 @@ async function main(): Promise<void> {
     entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
   });
 
-  // Ellipsoid debug view: draw each splat as its 3D covariance shape (M = R*S on a
-  // unit sphere), instanced. Toggle against the flat points with 'v'.
   const sphere = makeUnitSphere();
-  const sphereVertexBuffer = createBufferWithData(
-    device,
-    sphere.positions,
-    GPUBufferUsage.VERTEX,
-    'unit-sphere-verts',
-  );
-  const sphereIndexBuffer = createBufferWithData(
-    device,
-    sphere.indices,
-    GPUBufferUsage.INDEX,
-    'unit-sphere-indices',
-  );
-  const instanceBuffer = createBufferWithData(
-    device,
-    cloudToInstanceData(cloud),
-    GPUBufferUsage.VERTEX,
-    'splat-instances',
-  );
+  const sphereVertexBuffer = createBufferWithData(device, sphere.positions, GPUBufferUsage.VERTEX, 'unit-sphere-verts');
+  const sphereIndexBuffer = createBufferWithData(device, sphere.indices, GPUBufferUsage.INDEX, 'unit-sphere-indices');
   const ellipsoidModule = device.createShaderModule({ code: ellipsoidShaderSrc });
   const ellipsoidPipeline = device.createRenderPipeline({
     layout: 'auto',
-    vertex: {
-      module: ellipsoidModule,
-      entryPoint: 'vs',
-      buffers: [SPHERE_LAYOUT, INSTANCE_LAYOUT],
-    },
+    vertex: { module: ellipsoidModule, entryPoint: 'vs', buffers: [SPHERE_LAYOUT, INSTANCE_LAYOUT] },
     fragment: { module: ellipsoidModule, entryPoint: 'fs', targets: [{ format }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
@@ -223,37 +203,24 @@ async function main(): Promise<void> {
     entries: [{ binding: 0, resource: { buffer: cameraBuffer } }],
   });
 
-  // 2D splat billboards: project each Gaussian to a screen ellipse (EWA) and
-  // alpha-blend it. A static quad (per vertex) + splat instance data.
   const quadBuffer = createBufferWithData(
     device,
     new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]),
     GPUBufferUsage.VERTEX,
     'splat-quad',
   );
-  const splatInstances = cloudToSplatInstances(cloud);
-  const splatInstanceBuffer = createBufferWithData(
-    device,
-    splatInstances,
-    GPUBufferUsage.VERTEX,
-    'splat-instances-2d',
-  );
   const splatModule = device.createShaderModule({ code: splatShaderSrc });
   const splatPipeline = device.createRenderPipeline({
     layout: 'auto',
-    vertex: {
-      module: splatModule,
-      entryPoint: 'vs',
-      buffers: [QUAD_LAYOUT, SPLAT_INSTANCE_LAYOUT],
-    },
+    vertex: { module: splatModule, entryPoint: 'vs', buffers: [QUAD_LAYOUT, SPLAT_INSTANCE_LAYOUT] },
     fragment: {
       module: splatModule,
       entryPoint: 'fs',
       targets: [
         {
           format,
-          // Premultiplied-alpha "over" compositing.
           blend: {
+            // Premultiplied-alpha "over" compositing.
             color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
             alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
           },
@@ -261,16 +228,80 @@ async function main(): Promise<void> {
       ],
     },
     primitive: { topology: 'triangle-list' },
-    // Transparent: test against the grid, but don't write depth (so splats blend).
     depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: false, depthCompare: 'less' },
   });
-  // Lighting uniform + Tweakpane controls (the draggable relight).
   const lightingData = new Float32Array(16);
   const lightingBuffer = device.createBuffer({
     size: lightingData.byteLength,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  const d = camera.distance;
+  const splatBindGroup = device.createBindGroup({
+    layout: splatPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: cameraBuffer } },
+      { binding: 1, resource: { buffer: lightingBuffer } },
+    ],
+  });
+
+  const counts = new Uint32Array(NUM_BUCKETS); // reused sort scratch
+
+  // Build all cloud-dependent state (rebuilt on load / drag-drop).
+  const buildScene = (cloud: SplatCloud): Scene => {
+    const { center, radius } = fitCameraToCloud(camera, cloud);
+    const splatInstances = cloudToSplatInstances(cloud);
+    return {
+      cloud,
+      center,
+      radius,
+      pointBuffer: createBufferWithData(device, cloudToPointVertices(cloud), GPUBufferUsage.VERTEX, 'splat-points'),
+      instanceBuffer: createBufferWithData(device, cloudToInstanceData(cloud), GPUBufferUsage.VERTEX, 'splat-instances'),
+      splatInstanceBuffer: createBufferWithData(device, splatInstances, GPUBufferUsage.VERTEX, 'splat-instances-2d'),
+      splatInstances,
+      order: new Uint32Array(cloud.count),
+      depths: new Float32Array(cloud.count),
+      buckets: new Uint16Array(cloud.count),
+      sortedInstances: new Float32Array(splatInstances.length),
+    };
+  };
+
+  let scene = buildScene(await loadCloud());
+  let lastSortKey = '';
+
+  const loadIntoScene = (cloud: SplatCloud): void => {
+    scene.pointBuffer.destroy();
+    scene.instanceBuffer.destroy();
+    scene.splatInstanceBuffer.destroy();
+    scene = buildScene(cloud);
+    lastSortKey = '';
+  };
+
+  // Load a .ply by dragging it onto the window, or via the panel button below.
+  const loadFile = async (file: File): Promise<void> => {
+    try {
+      loadIntoScene(parsePly(await file.arrayBuffer()));
+      console.log(`Loaded ${file.name}: ${scene.cloud.count} splats`);
+    } catch (err) {
+      console.error(`Failed to load ${file.name}:`, err);
+    }
+  };
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e: DragEvent) => {
+    e.preventDefault();
+    const file = e.dataTransfer?.files?.[0];
+    if (file) void loadFile(file);
+  });
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = '.ply';
+  fileInput.style.display = 'none';
+  document.body.appendChild(fileInput);
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files?.[0];
+    if (file) void loadFile(file);
+    fileInput.value = '';
+  });
+
+  // --- lighting controls (light position is in units of the scene radius) ---
   const lightParams = {
     relight: 0.7,
     intensity: 1.0,
@@ -278,15 +309,18 @@ async function main(): Promise<void> {
     shininess: 24,
     specular: 0.25,
     color: '#ffffff',
-    posX: objectCenter[0] + d,
-    posY: objectCenter[1] + d,
-    posZ: objectCenter[2] + d * 0.6,
+    normalMode: 0, // 0 = object (centroid), 1 = scene (camera-facing)
+    offX: 1.5,
+    offY: 1.5,
+    offZ: 1.0,
   };
   const packLighting = (): void => {
     const [lr, lg, lb] = hexToRgb(lightParams.color);
-    lightingData[0] = lightParams.posX;
-    lightingData[1] = lightParams.posY;
-    lightingData[2] = lightParams.posZ;
+    const [cx, cy, cz] = scene.center;
+    const r = scene.radius;
+    lightingData[0] = cx + lightParams.offX * r;
+    lightingData[1] = cy + lightParams.offY * r;
+    lightingData[2] = cz + lightParams.offZ * r;
     lightingData[3] = lightParams.intensity;
     lightingData[4] = lr;
     lightingData[5] = lg;
@@ -297,97 +331,70 @@ async function main(): Promise<void> {
     lightingData[10] = lightParams.specular;
     lightingData[11] = lightParams.shininess;
     lightingData[12] = lightParams.relight;
+    lightingData[13] = lightParams.normalMode;
     writeBuffer(device, lightingBuffer, lightingData);
   };
 
   const pane = new Pane({ title: 'lighting' });
+  pane.addButton({ title: 'load .ply…' }).on('click', () => fileInput.click());
   pane.addBinding(lightParams, 'relight', { min: 0, max: 1, step: 0.01 });
   pane.addBinding(lightParams, 'intensity', { min: 0, max: 3, step: 0.01 });
   pane.addBinding(lightParams, 'ambient', { min: 0, max: 1, step: 0.01 });
   pane.addBinding(lightParams, 'shininess', { min: 1, max: 128, step: 1 });
   pane.addBinding(lightParams, 'specular', { min: 0, max: 1, step: 0.01 });
   pane.addBinding(lightParams, 'color');
-  const lightFolder = pane.addFolder({ title: 'light position' });
-  lightFolder.addBinding(lightParams, 'posX', { min: objectCenter[0] - 3 * d, max: objectCenter[0] + 3 * d });
-  lightFolder.addBinding(lightParams, 'posY', { min: objectCenter[1] - 3 * d, max: objectCenter[1] + 3 * d });
-  lightFolder.addBinding(lightParams, 'posZ', { min: objectCenter[2] - 3 * d, max: objectCenter[2] + 3 * d });
-
-  const splatBindGroup = device.createBindGroup({
-    layout: splatPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: cameraBuffer } },
-      { binding: 1, resource: { buffer: lightingBuffer } },
-    ],
+  pane.addBinding(lightParams, 'normalMode', {
+    label: 'normals',
+    options: { 'object (centroid)': 0, 'scene (camera-facing)': 1 },
   });
+  const lightFolder = pane.addFolder({ title: 'light position (× radius)' });
+  lightFolder.addBinding(lightParams, 'offX', { min: -4, max: 4, step: 0.05 });
+  lightFolder.addBinding(lightParams, 'offY', { min: -4, max: 4, step: 0.05 });
+  lightFolder.addBinding(lightParams, 'offZ', { min: -4, max: 4, step: 0.05 });
 
-  // View cycle: 'v' rotates through the 2D splats, the 3D ellipsoids, and points.
+  // View cycle: 'v' rotates through splats / normals / ellipsoids / points.
   const VIEWS = ['splats', 'normals', 'ellipsoids', 'points'] as const;
   let viewIndex = 0;
   window.addEventListener('keydown', (e) => {
     if (e.key === 'v' || e.key === 'V') viewIndex = (viewIndex + 1) % VIEWS.length;
   });
 
-  // [concept] Depth sort: "over" blending is order-dependent, so splats must be
-  // drawn back-to-front. We quantize each splat's camera-space depth to a 16-bit
-  // bucket and counting-sort — O(n) with no per-comparison function calls — then
-  // rewrite the instance buffer in that order. Only re-sorts when the camera moved.
-  const SPLAT_FLOATS = 14;
-  const NUM_BUCKETS = 65536; // 16-bit depth quantization
-  const order = new Uint32Array(cloud.count);
-  const depths = new Float32Array(cloud.count);
-  const buckets = new Uint16Array(cloud.count);
-  const counts = new Uint32Array(NUM_BUCKETS);
-  const sortedInstances = new Float32Array(splatInstances.length);
-  let lastSortKey = '';
-
+  // [concept] Depth sort: back-to-front via a 16-bit counting sort; reorder the
+  // instance buffer and re-upload. Re-sorts only when the camera moved.
   const sortSplats = (): void => {
     const key = `${camera.azimuth}|${camera.elevation}|${camera.distance}|${camera.target[0]}|${camera.target[1]}|${camera.target[2]}`;
     if (key === lastSortKey) return;
     lastSortKey = key;
 
-    // 1. Camera-space z per splat (row 2 of the view matrix), tracking the range.
+    const { cloud, splatInstances, order, depths, buckets, sortedInstances, splatInstanceBuffer } = scene;
+
     const m = camera.viewMatrix;
     let min = Infinity;
     let max = -Infinity;
     for (let i = 0; i < cloud.count; i++) {
       const p = i * 3;
-      const z =
-        m[2] * cloud.positions[p] +
-        m[6] * cloud.positions[p + 1] +
-        m[10] * cloud.positions[p + 2] +
-        m[14];
+      const z = m[2] * cloud.positions[p] + m[6] * cloud.positions[p + 1] + m[10] * cloud.positions[p + 2] + m[14];
       depths[i] = z;
       if (z < min) min = z;
       if (z > max) max = z;
     }
-
-    // 2. Quantize depth → 16-bit bucket. Front is z<0, so smaller z (smaller
-    //    bucket) = farther = drawn first = back-to-front.
     const scale = max > min ? (NUM_BUCKETS - 1) / (max - min) : 0;
     for (let i = 0; i < cloud.count; i++) {
       buckets[i] = Math.min(NUM_BUCKETS - 1, ((depths[i] - min) * scale) | 0);
     }
-
-    // 3. Counting sort into `order` — no comparisons.
     counts.fill(0);
-    for (let i = 0; i < cloud.count; i++) counts[buckets[i]]++; // tally per bucket
-    let running = 0; // prefix sum → each bucket's start offset
+    for (let i = 0; i < cloud.count; i++) counts[buckets[i]]++;
+    let running = 0;
     for (let b = 0; b < NUM_BUCKETS; b++) {
       const c = counts[b];
       counts[b] = running;
       running += c;
     }
-    for (let i = 0; i < cloud.count; i++) {
-      order[counts[buckets[i]]++] = i; // place splat i, advance its bucket's slot
-    }
-
-    // 4. Gather the instance data into sorted order and upload.
+    for (let i = 0; i < cloud.count; i++) order[counts[buckets[i]]++] = i;
     for (let i = 0; i < cloud.count; i++) {
       const src = order[i] * SPLAT_FLOATS;
       const dst = i * SPLAT_FLOATS;
-      for (let k = 0; k < SPLAT_FLOATS; k++) {
-        sortedInstances[dst + k] = splatInstances[src + k];
-      }
+      for (let k = 0; k < SPLAT_FLOATS; k++) sortedInstances[dst + k] = splatInstances[src + k];
     }
     writeBuffer(device, splatInstanceBuffer, sortedInstances);
   };
@@ -416,9 +423,9 @@ async function main(): Promise<void> {
     const focal = (0.5 * canvas.height) / Math.tan(0.5 * camera.fovY);
     cameraData.set(viewProj, 0);
     cameraData.set(camera.viewMatrix, 16);
-    cameraData[32] = objectCenter[0];
-    cameraData[33] = objectCenter[1];
-    cameraData[34] = objectCenter[2];
+    cameraData[32] = scene.center[0];
+    cameraData[33] = scene.center[1];
+    cameraData[34] = scene.center[2];
     cameraData[35] = view === 'normals' ? 1 : 0; // renderMode
     cameraData[36] = focal;
     cameraData[37] = focal;
@@ -450,8 +457,8 @@ async function main(): Promise<void> {
       },
     });
 
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
+    pass.setPipeline(gridPipeline);
+    pass.setBindGroup(0, gridBindGroup);
     pass.setVertexBuffer(0, vertexBuffer);
     pass.draw(grid.vertexCount);
 
@@ -459,20 +466,20 @@ async function main(): Promise<void> {
       pass.setPipeline(splatPipeline);
       pass.setBindGroup(0, splatBindGroup);
       pass.setVertexBuffer(0, quadBuffer);
-      pass.setVertexBuffer(1, splatInstanceBuffer);
-      pass.draw(6, cloud.count);
+      pass.setVertexBuffer(1, scene.splatInstanceBuffer);
+      pass.draw(6, scene.cloud.count);
     } else if (view === 'ellipsoids') {
       pass.setPipeline(ellipsoidPipeline);
       pass.setBindGroup(0, ellipsoidBindGroup);
       pass.setVertexBuffer(0, sphereVertexBuffer);
-      pass.setVertexBuffer(1, instanceBuffer);
+      pass.setVertexBuffer(1, scene.instanceBuffer);
       pass.setIndexBuffer(sphereIndexBuffer, 'uint16');
-      pass.drawIndexed(sphere.indexCount, cloud.count);
+      pass.drawIndexed(sphere.indexCount, scene.cloud.count);
     } else {
       pass.setPipeline(pointsPipeline);
       pass.setBindGroup(0, pointsBindGroup);
-      pass.setVertexBuffer(0, pointBuffer);
-      pass.draw(cloud.count);
+      pass.setVertexBuffer(0, scene.pointBuffer);
+      pass.draw(scene.cloud.count);
     }
     pass.end();
 
